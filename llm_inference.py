@@ -1,152 +1,258 @@
-import torch
-import os
-from typing import Tuple, Optional
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
-from llama_cpp import Llama  # 可选：llama.cpp Python绑定（轻量高效）
-from decision_layer.context_processor import ContextProcessor  # 导入上下文处理器
+"""
+智能决策层 - Ollama 客户端模块
+对接本地 Ollama 服务，支持多模态（视觉 + 文本）推理
+仅使用 requests 标准库，不依赖 transformers 或 llama-cpp-python
+"""
+import base64
+import json
+import logging
+from typing import Tuple, Optional, Dict, Any
+from pathlib import Path
+
+import requests
+
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 
 class LLMInference:
     """
-    本地LLM推理工具类（决策层核心组件），将ContextProcessor生成的文本提示输入本地模型（如Llama/Mistral），
-    输出结构化决策建议（含教学提示），为展示层提供“可解释的行动指导”。
-    所属层：决策层（Decision Layer）
+    Ollama API 客户端，用于与 qwen3-vl 等多模态模型交互
+    支持将屏幕截图转为 Base64 并通过 Ollama /api/chat 接口发送
     """
 
-    def __init__(self, model_path: str, model_type: str = "hf", device: str = "auto", **kwargs):
-        """
-        初始化LLM推理器
-        :param model_path: 模型路径（本地目录或Hugging Face Hub名称，如"meta-llama/Llama-2-7b-chat-hf"）
-        :param model_type: 模型类型（"hf"=Hugging Face Transformers，"llama.cpp"=llama.cpp）
-        :param device: 运行设备（"auto"/"cpu"/"cuda"，仅HF有效）
-        :param kwargs: 模型参数（如HF的load_in_4bit=True，llama.cpp的n_ctx=2048）
-        """
-        self.model_path = model_path
-        self.model_type = model_type.lower()
-        self.device = device
-        self.kwargs = kwargs
-        self.model = None
-        self.tokenizer = None
-        self.llm = None  # llama.cpp实例
-        self._load_model()
+    # System Prompt：要求模型输出严格格式
+    SYSTEM_PROMPT = """你是一个桌面自动化助手。请分析用户提供的屏幕截图，并给出操作建议。
+请严格按照以下格式输出：
+决策建议：<具体的操作建议，如"点击提交按钮">
+教学提示：<分步骤的教学提示，如"步骤 1：找到提交按钮；步骤 2：点击它">
 
-    def _load_model(self):
-        """加载本地模型（支持HF Transformers和llama.cpp两种后端）"""
-        if self.model_type == "hf":
-            # Hugging Face Transformers加载（支持量化/GPU加速）
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True)
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_path,
-                device_map=self.device,
-                load_in_4bit=self.kwargs.get("load_in_4bit", False),  # 4位量化（节省显存）
-                torch_dtype=torch.float16 if "cuda" in self.device else torch.float32,
-                trust_remote_code=True,
-                **{k: v for k, v in self.kwargs.items() if k != "load_in_4bit"}
-            )
-        elif self.model_type == "llama.cpp":
-            # llama.cpp加载（轻量高效，适合CPU环境）
-            self.llm = Llama(
-                model_path=self.model_path,
-                n_ctx=self.kwargs.get("n_ctx", 2048),  # 上下文长度
-                n_threads=self.kwargs.get("n_threads", 4),  # CPU线程数
-                n_gpu_layers=self.kwargs.get("n_gpu_layers", 0)  # GPU加速层数（0=纯CPU）
-            )
-        else:
-            raise ValueError(f"不支持的模型类型：{self.model_type}（可选hf/llama.cpp）")
+注意：只输出上述两个字段，不要添加其他内容。"""
 
-    def generate_suggestion(self, prompt: str) -> Tuple[str, str]:
+    def __init__(
+        self,
+        base_url: str = "http://localhost:11434",
+        model: str = "qwen3-vl:latest",
+        timeout: int = 60
+    ):
         """
-        LLM推理入口：输入ContextProcessor生成的提示文本，输出决策建议+教学提示
-        :param prompt: 文本提示（来自ContextProcessor.format_for_llm）
-        :return: (决策建议, 教学提示) 双字符串元组
+        初始化 Ollama 客户端
+        :param base_url: Ollama API 基础 URL
+        :param model: 模型名称
+        :param timeout: 请求超时时间（秒）
         """
-        if self.model_type == "hf":
-            return self._hf_generate(prompt)
-        elif self.model_type == "llama.cpp":
-            return self._llama_cpp_generate(prompt)
-        else:
-            raise RuntimeError("模型未正确加载")
+        self.base_url = base_url.rstrip('/')
+        self.model = model
+        self.timeout = timeout
+        self.api_endpoint = f"{self.base_url}/api/chat"
+        
+        logger.info(f"LLMInference 初始化完成：base_url={self.base_url}, model={self.model}")
 
-    def _hf_generate(self, prompt: str) -> Tuple[str, str]:
-        """Hugging Face Transformers推理（适合高精度生成）"""
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-        outputs = self.model.generate(
-            **inputs,
-            max_new_tokens=self.kwargs.get("max_new_tokens", 512),  # 最大生成长度
-            temperature=self.kwargs.get("temperature", 0.7),  # 随机性（0-1，越低越确定）
-            do_sample=True,
-            pad_token_id=self.tokenizer.eos_token_id
-        )
-        response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        # 解析输出：提取“决策建议”和“教学提示”（按约定格式）
-        return self._parse_response(response)
-
-    def _llama_cpp_generate(self, prompt: str) -> Tuple[str, str]:
-        """llama.cpp推理（适合低资源环境）"""
-        response = self.llm(
-            prompt,
-            max_tokens=self.kwargs.get("max_tokens", 512),
-            temperature=self.kwargs.get("temperature", 0.7),
-            stop=["</s>", "###"]  # 停止符（根据模型调整）
-        )["choices"][0]["text"]
-        return self._parse_response(response)
-
-    @staticmethod
-    def _parse_response(response: str) -> Tuple[str, str]:
+    def _image_to_base64(self, image_bytes: bytes) -> str:
         """
-        解析LLM输出（按约定格式：“决策建议：XXX\n教学提示：XXX”）
-        若格式不符，自动分割为两部分（前50%为建议，后50%为提示）
+        将图像 bytes 转换为 Base64 字符串
+        :param image_bytes: PNG 或其他格式的图像 bytes
+        :return: Base64 编码字符串
         """
+        return base64.b64encode(image_bytes).decode('utf-8')
+
+    def _parse_response(self, response_text: str) -> Tuple[str, str]:
+        """
+        解析 LLM 响应，提取决策建议和教学提示
+        处理模型输出格式偏差，提供健壮的解析逻辑
+        :param response_text: 模型原始响应文本
+        :return: (决策建议，教学提示) 元组
+        """
+        suggestion = ""
+        tip = ""
+
+        # 处理空响应
+        if not response_text or not response_text.strip():
+            return "无法解析建议", "无教学提示"
+
         # 尝试按关键词分割
-        if "决策建议：" in response and "教学提示：" in response:
-            suggestion_part = response.split("决策建议：")[1].split("教学提示：")[0].strip()
-            tip_part = response.split("教学提示：")[1].strip()
+        if "决策建议：" in response_text and "教学提示：" in response_text:
+            try:
+                suggestion_part = response_text.split("决策建议：")[1].split("教学提示：")[0].strip()
+                tip_part = response_text.split("教学提示：")[1].strip()
+                suggestion = suggestion_part
+                tip = tip_part
+            except (IndexError, AttributeError) as e:
+                logger.warning(f"解析失败，使用 fallback 策略：{e}")
+                lines = response_text.strip().split("\n")
+                suggestion = lines[0][:200] if lines else "无法解析建议"
+                tip = "\n".join(lines[1:])[:500] if len(lines) > 1 else "无教学提示"
+        elif "决策建议:" in response_text and "教学提示:" in response_text:
+            # 兼容英文冒号
+            try:
+                suggestion_part = response_text.split("决策建议:")[1].split("教学提示:")[0].strip()
+                tip_part = response_text.split("教学提示:")[1].strip()
+                suggestion = suggestion_part
+                tip = tip_part
+            except (IndexError, AttributeError) as e:
+                logger.warning(f"解析失败，使用 fallback 策略：{e}")
+                lines = response_text.strip().split("\n")
+                suggestion = lines[0][:200] if lines else "无法解析建议"
+                tip = "\n".join(lines[1:])[:500] if len(lines) > 1 else "无教学提示"
         else:
-            #  fallback：按行分割取首句和剩余部分
-            lines = response.strip().split("\n")
-            suggestion_part = lines[0][:200]  # 首行前200字符为建议
-            tip_part = "\n".join(lines[1:])[:500]  # 剩余为提示（限长500）
-        return suggestion_part, tip_part
+            # Fallback：按行分割取首句和剩余部分
+            lines = response_text.strip().split("\n")
+            suggestion = lines[0][:200] if lines else "无法解析建议"
+            tip = "\n".join(lines[1:])[:500] if len(lines) > 1 else "无教学提示"
 
-    def unload_model(self):
-        """释放模型资源（避免内存泄漏）"""
-        if self.model_type == "hf":
-            del self.model
-            del self.tokenizer
-            torch.cuda.empty_cache() if torch.cuda.is_available() else None
-        elif self.model_type == "llama.cpp":
-            del self.llm
-        self.model = None
-        self.tokenizer = None
-        self.llm = None
+        return suggestion, tip
+
+    def infer(
+        self,
+        image_bytes: Optional[bytes] = None,
+        user_prompt: str = "请分析当前屏幕并给出操作建议",
+        stream: bool = False
+    ) -> Tuple[str, str]:
+        """
+        执行多模态推理
+        :param image_bytes: 屏幕截图的 PNG bytes（可选）
+        :param user_prompt: 用户自定义提示词
+        :param stream: 是否使用流式响应
+        :return: (决策建议，教学提示) 元组
+        :raises ConnectionError: Ollama 服务不可达
+        :raises TimeoutError: 请求超时
+        :raises ValueError: 模型响应格式错误
+        """
+        # 构建消息内容
+        content = []
+        
+        # 如果有图像，添加图像内容
+        if image_bytes:
+            base64_image = self._image_to_base64(image_bytes)
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{base64_image}"}
+            })
+        
+        # 添加文本提示
+        full_prompt = f"{self.SYSTEM_PROMPT}\n\n用户问题：{user_prompt}"
+        content.append({"type": "text", "text": full_prompt})
+        
+        messages = [
+            {
+                "role": "user",
+                "content": content
+            }
+        ]
+        
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "stream": stream
+        }
+        
+        logger.info(f"发送请求到 Ollama API: {self.api_endpoint}")
+        
+        try:
+            response = requests.post(
+                self.api_endpoint,
+                json=payload,
+                timeout=self.timeout,
+                stream=stream
+            )
+            response.raise_for_status()
+            
+            if stream:
+                # 流式响应处理
+                full_response = ""
+                for line in response.iter_lines():
+                    if line:
+                        json_response = json.loads(line)
+                        if "message" in json_response and "content" in json_response["message"]:
+                            full_response += json_response["message"]["content"]
+                response_text = full_response
+            else:
+                # 非流式响应
+                result = response.json()
+                response_text = result.get("message", {}).get("content", "")
+            
+            logger.info(f"收到模型响应，长度：{len(response_text)}")
+            return self._parse_response(response_text)
+            
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"Ollama 连接失败：{e}")
+            raise ConnectionError(f"无法连接到 Ollama 服务 ({self.base_url})") from e
+        except requests.exceptions.Timeout as e:
+            logger.error(f"请求超时：{e}")
+            raise TimeoutError(f"Ollama 请求超时 ({self.timeout}秒)") from e
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"HTTP 错误：{e}")
+            raise ValueError(f"Ollama API 返回错误：{e.response.status_code}") from e
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON 解析失败：{e}")
+            raise ValueError(f"无法解析 Ollama 响应") from e
+
+    def infer_text_only(
+        self,
+        user_prompt: str,
+        stream: bool = False
+    ) -> Tuple[str, str]:
+        """
+        纯文本推理（不使用图像）
+        :param user_prompt: 用户提示词
+        :param stream: 是否使用流式响应
+        :return: (决策建议，教学提示) 元组
+        """
+        return self.infer(image_bytes=None, user_prompt=user_prompt, stream=stream)
+
+    def health_check(self) -> bool:
+        """
+        检查 Ollama 服务是否可用
+        :return: True 如果服务可用，False 否则
+        """
+        try:
+            response = requests.get(f"{self.base_url}/api/tags", timeout=5)
+            return response.status_code == 200
+        except Exception as e:
+            logger.warning(f"健康检查失败：{e}")
+            return False
 
 
-# 示例：与ContextProcessor联动（实际使用时需删除示例，仅保留类定义）
-# if __name__ == "__main__":
-#     from decision_layer.context_processor import ContextProcessor
-#     from screen_capture_layer import OCREngine, ObjectDetector, ScreenCapturer
-#
-#     # 1. 初始化感知层组件
-#     capturer = ScreenCapturer()
-#     ocr = OCREngine(engine="tesseract", lang="chi_sim+eng")
-#     detector = ObjectDetector(detector_type="template", template_dir="templates")
-#     context_processor = ContextProcessor(ocr, detector)
-#
-#     # 2. 模拟截屏与上下文生成
-#     image = capturer.capture()
-#     context = context_processor.process(image)
-#     llm_prompt = context_processor.format_for_llm(context)
-#
-#     # 3. 初始化LLM推理器（以llama.cpp为例，需提前下载gguf模型）
-#     llm = LLMInference(
-#         model_path="models/llama-2-7b-chat.Q4_K_M.gguf",
-#         model_type="llama.cpp",
-#         n_ctx=2048,
-#         n_threads=4
-#     )
-#
-#     # 4. 生成决策建议与教学提示
-#     suggestion, tip = llm.generate_suggestion(llm_prompt)
-#     print(f"决策建议：{suggestion}\n教学提示：{tip}")
-#
-#     # 5. 释放资源
-#     llm.unload_model()
+# 单元测试用例（模拟 API 响应）
+def test_llm_inference():
+    """测试 LLMInference 类的解析逻辑"""
+    llm = LLMInference(base_url="http://mock-url", model="test-model")
+    
+    # 测试正常格式解析
+    normal_response = "决策建议：点击提交按钮\n教学提示：步骤 1：找到按钮；步骤 2：点击"
+    suggestion, tip = llm._parse_response(normal_response)
+    assert "点击提交按钮" in suggestion
+    assert "步骤 1" in tip
+    print("✓ 正常格式解析测试通过")
+    
+    # 测试英文冒号格式
+    colon_response = "决策建议：打开文件\n教学提示：先选择文件"
+    suggestion, tip = llm._parse_response(colon_response)
+    assert "打开文件" in suggestion
+    assert "先选择文件" in tip
+    print("✓ 英文冒号格式解析测试通过")
+    
+    # 测试 fallback 格式
+    fallback_response = "第一行是建议\n第二行是提示\n第三行也是提示"
+    suggestion, tip = llm._parse_response(fallback_response)
+    assert "第一行是建议" in suggestion
+    assert "第二行是提示" in tip
+    print("✓ Fallback 格式解析测试通过")
+    
+    # 测试空响应
+    empty_response = ""
+    suggestion, tip = llm._parse_response(empty_response)
+    assert suggestion == "无法解析建议"
+    assert tip == "无教学提示"
+    print("✓ 空响应解析测试通过")
+    
+    print("\n所有单元测试通过！")
+
+
+if __name__ == "__main__":
+    test_llm_inference()

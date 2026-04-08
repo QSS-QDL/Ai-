@@ -1,0 +1,23 @@
+# Voice 桌面自动化助手 - 依赖清单
+
+# GUI 框架
+PyQt6>=6.4.0
+
+# 屏幕截图
+mss>=9.0.1
+Pillow>=10.0.0
+
+# HTTP 请求（Ollama API）
+requests>=2.31.0
+
+# 自动化执行
+pyautogui>=0.9.54
+
+# 配置管理（内置于 Python 标准库）
+# configparser
+
+# 类型注解（Python 3.9+ 内置）
+# typing
+
+# 日志（内置于 Python 标准库）
+# logging
